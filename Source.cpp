@@ -4,6 +4,7 @@ extern "C" {
 #include "NativeStructs.h"
 }
 #include "defs.h"
+#include "hyperdetect.h"
 
 #define xorstr_(x) x
 
@@ -18,45 +19,11 @@ void sleep(LONG milliseconds)
 }
 
 
-PVOID g_KernelBase = nullptr;
-
-EXTERN_C NTSYSAPI
-PIMAGE_NT_HEADERS
-NTAPI
-RtlImageNtHeader(PVOID Base);
-
-void get_ntoskrnl_text_section(uintptr_t* start_addr, ULONG* len)
-{
-	*start_addr = NULL;
-	*len = NULL;
-	auto base = GetKernelBase();
-	PIMAGE_NT_HEADERS64 pHdr = RtlImageNtHeader(base);
-	if (!pHdr)
-		return; 
-
-	PIMAGE_SECTION_HEADER pFirstSection = (PIMAGE_SECTION_HEADER)(pHdr + 1);
-	//PIMAGE_SECTION_HEADER pFirstSection = (PIMAGE_SECTION_HEADER)((uintptr_t)&pHdr->FileHeader + pHdr->FileHeader.SizeOfOptionalHeader + sizeof(IMAGE_FILE_HEADER));
-
-	for (PIMAGE_SECTION_HEADER pSection = pFirstSection; pSection < pFirstSection + pHdr->FileHeader.NumberOfSections; pSection++)
-	{
-		//DbgPrint("section: %s\r\n", pSection->Name);
-		ANSI_STRING s1, s2;
-		RtlInitAnsiString(&s1, ".text");
-		RtlInitAnsiString(&s2, (PCCHAR)pSection->Name);
-		if (RtlCompareString(&s1, &s2, TRUE) == 0)
-		{
-			*start_addr = (uintptr_t)((PUCHAR)base + pSection->VirtualAddress);
-			*len = pSection->Misc.VirtualSize;
-			return;
-		}
-	}
-}
-
 NTSTATUS BBSearchPattern(IN PCUCHAR pattern, IN UCHAR wildcard, IN ULONG_PTR len, IN const VOID* base, IN ULONG_PTR size, OUT PVOID* ppFound, int index = 0)
 {
 	ASSERT(ppFound != NULL && pattern != NULL && base != NULL);
 	if (ppFound == NULL || pattern == NULL || base == NULL)
-		return STATUS_INVALID_PARAMETER;
+		return STATUS_ACCESS_DENIED; //STATUS_INVALID_PARAMETER;
 	int cIndex = 0;
 	for (ULONG_PTR i = 0; i < size - len; i++)
 	{
@@ -84,16 +51,16 @@ NTSTATUS BBScanSection(IN PCCHAR section, IN PCUCHAR pattern, IN UCHAR wildcard,
 {
 	//ASSERT(ppFound != NULL);
 	if (ppFound == NULL)
-		return STATUS_INVALID_PARAMETER;
+		return STATUS_ACCESS_DENIED; //STATUS_INVALID_PARAMETER
 
 	if (nullptr == base)
 		base = GetKernelBase();
 	if (base == nullptr)
-		return STATUS_NOT_FOUND;
+		return STATUS_ACCESS_DENIED; //STATUS_NOT_FOUND;
 
 	PIMAGE_NT_HEADERS64 pHdr = RtlImageNtHeader(base);
 	if (!pHdr)
-		return STATUS_INVALID_IMAGE_FORMAT;
+		return STATUS_ACCESS_DENIED; // STATUS_INVALID_IMAGE_FORMAT;
 
 	//PIMAGE_SECTION_HEADER pFirstSection = (PIMAGE_SECTION_HEADER)(pHdr + 1);
 	PIMAGE_SECTION_HEADER pFirstSection = (PIMAGE_SECTION_HEADER)((uintptr_t)&pHdr->FileHeader + pHdr->FileHeader.SizeOfOptionalHeader + sizeof(IMAGE_FILE_HEADER));
@@ -500,16 +467,33 @@ void scan_bigpool_check_2()
 		auto pBuf = reinterpret_cast<PSYSTEM_BIGPOOL_INFORMATION>(mem);
 		for (ULONG i = 0; i < pBuf->Count; i++) {
 			__try {
-				if (auto page = MmMapIoSpace(MmGetPhysicalAddress((void*)pBuf->AllocatedInfo[i].VirtualAddress), PAGE_SIZE, MEMORY_CACHING_TYPE::MmCached)) {
-					if (*(PULONG)((uintptr_t)page + 0x184) == 0xB024BC8B48)
-						DbgPrint("[DETECTION] 0xB024BC8B48 found at pool + 0x184\n");
+				/*if (auto page = MmMapIoSpaceEx(MmGetPhysicalAddress((void*)pBuf->AllocatedInfo[i].VirtualAddress), PAGE_SIZE, PAGE_READWRITE)) {
+					
 					MmUnmapIoSpace(page, PAGE_SIZE);
 				}
+				*/
+
 				//https://www.unknowncheats.me/forum/2427433-post12.html
-				if (pBuf->AllocatedInfo[i].TagUlong == 'SldT')
-					DbgPrint("[DETECTION] TdlS pooltag detected\n");
+				if (pBuf->AllocatedInfo[i].TagUlong == 'SldT') {
+					DbgPrint("[FLAG] TdlS pooltag detected\n");
+					if (auto page = MmMapIoSpaceEx(MmGetPhysicalAddress((void*)pBuf->AllocatedInfo[i].VirtualAddress), PAGE_SIZE, PAGE_READWRITE)) {
+						if (*(PULONG)((uintptr_t)page + 0x184) == 0x0B024BC8B48)
+							DbgPrint("[DETECTION] 0x0B024BC8B48 found at pool + 0x184\n");
+						//to-do: also hash the memory(with custom crc32 table) and check for 0C8931AEBh
 
+						MmUnmapIoSpace(page, PAGE_SIZE);
+					}
+				}
 
+				/*
+				pooltags checked:
+				 if ( *(v3 - 1) != 'rcIC' || *v3 <= v3[1] )
+        {
+          if ( *(v3 - 1) == 'csIC' && *v3 > v3[1] )
+
+		  if these pooltags do not exist, code integrity is disabled(maybe this occurs due to UPGDSED, which disables the initialization of CI?)
+				*/
+				
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				DbgPrint("Access Violation was raised (scan_bigpool_check_2).\n");
@@ -643,13 +627,379 @@ void check_piddb()
 	ExReleaseResourceLite(PiDDBLock);
 }
 
+static inline unsigned long long rdtsc_diff_vmexit() {
+	auto t1 = __rdtsc();
+	int r[4];
+	__cpuid(r, 1);
+	return __rdtsc() - t1;
+}
+
+int cpu_rdtsc_force_vmexit() {
+	int i;
+	unsigned long long avg = 0;
+	for (i = 0; i < 10; i++) {
+		avg = avg + rdtsc_diff_vmexit();
+		sleep(500);
+	}
+	avg = avg / 10;
+	return (avg < 1000 && avg > 0) ? FALSE : TRUE;
+}
+
+bool detect_hypervisor()
+{
+	if (cpu_rdtsc_force_vmexit()) {
+		DbgPrint("Detected hypervisor through a timing attack\n");
+		return true;
+	}
+
+	__try {
+		__vmx_vmread(NULL, nullptr);
+		DbgPrint("Detected hypervisor through vmread\n");
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+
+	}
+	return false;
+}
+
+#pragma pack(push, 4)
+#define POBJECT PVOID
+
+typedef struct _SYSTEM_HANDLE
+{
+	ULONG 	uIdProcess;
+	UCHAR 	ObjectType;
+	UCHAR 	Flags;
+	USHORT 	Handle;
+	POBJECT 	pObject;
+	ACCESS_MASK 	GrantedAccess;
+}SYSTEM_HANDLE;
+
+typedef struct _SYSTEM_HANDLE_INFORMATION {
+	ULONG			uCount;
+	SYSTEM_HANDLE	Handles[ANYSIZE_ARRAY];
+} SYSTEM_HANDLE_INFORMATION, *PSYSTEM_HANDLE_INFORMATION;
+
+#pragma pack(pop)
+
+PSYSTEM_HANDLE_INFORMATION GetHandleList()
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	ULONG neededSize = 0;
+
+	//ZwQuerySystemInformation(SystemHandleInformation, &neededSize, 0, &neededSize); //returns incorrect size for whatever reason -- don't use.
+	neededSize = 8 * 1024 * 1024;
+
+	PSYSTEM_HANDLE_INFORMATION pHandleList;
+
+	if (pHandleList = (PSYSTEM_HANDLE_INFORMATION)ExAllocatePoolWithTag(NonPagedPool, neededSize, POOL_TAG)) {
+
+		NTSTATUS r;
+		if (NT_SUCCESS(r = ZwQuerySystemInformation(SystemHandleInformation, pHandleList, neededSize, 0)))
+			return pHandleList;
+		else
+			DbgPrint("r = %x\n", r);
+	}
+	return nullptr;
+}
+
+
+void check_physical_memory_handles()
+{
+	auto handles = GetHandleList();
+	if (!handles) {
+		DbgPrint("Unable to obtain handle list\n");
+		return;
+	}
+	UNICODE_STRING phys_mem_str;
+	OBJECT_ATTRIBUTES oaAttributes;
+	RtlInitUnicodeString(&phys_mem_str, xorstr_(L"\\Device\\PhysicalMemory"));
+	InitializeObjectAttributes(&oaAttributes, &phys_mem_str, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, (HANDLE)NULL, (PSECURITY_DESCRIPTOR)NULL);
+	HANDLE hPhysMem;
+	auto ntStatus = ZwOpenSection(&hPhysMem, SECTION_ALL_ACCESS, &oaAttributes);
+
+	PVOID Object;
+	if (!NT_SUCCESS(ObReferenceObjectByHandle(hPhysMem, 1, nullptr, KernelMode, &Object, nullptr))) {
+		DbgPrint("Unablle to get PhyiscalMemory object.\n");
+		ExFreePoolWithTag(handles, POOL_TAG);
+		ZwClose(hPhysMem);
+		return;
+	}
+
+	ZwClose(hPhysMem);
+
+	__try {
+		for (ULONG i = 0; i < handles->uCount; i++) {
+			if (handles->Handles[i].uIdProcess == 4)
+				continue; //ignore system process for detection.
+			if (handles->Handles[i].pObject == Object) { //is PhysicalMemory object?
+				//DbgPrint("found physmem handle\n");
+				 if (!ObIsKernelHandle((HANDLE)handles->Handles[i].Handle))
+					DbgPrint("[DETECTION] Usermode PhysicalMemory handle detected, pid = %d, access = 0x%x.\n", handles->Handles[i].uIdProcess, handles->Handles[i].GrantedAccess);
+			}
+		}
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		DbgPrint("Unexpected AV in check_physical_memory_handles\n");
+	}
+
+	ObDereferenceObject(Object);
+
+	ExFreePoolWithTag(handles, POOL_TAG);
+}
+
+PSYSTEM_PROCESS_INFO get_process_list()
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	ULONG neededSize = 0;
+
+	neededSize = 8 * 1024 * 1024;
+
+	PSYSTEM_PROCESS_INFO pProcessList;
+
+	if (pProcessList = (decltype(pProcessList))ExAllocatePoolWithTag(NonPagedPool, neededSize, POOL_TAG)) {
+
+		NTSTATUS r;
+		if (NT_SUCCESS(r = ZwQuerySystemInformation(SystemProcessInformation, pProcessList, neededSize, 0)))
+			return pProcessList;
+		else
+			DbgPrint("r = %x\n", r);
+	}
+	return nullptr;
+
+}
+
+#include "page_table_defs.h"
+
+void detect_perfect_injector()
+{
+	UNICODE_STRING phys_mem_str;
+	OBJECT_ATTRIBUTES oaAttributes;
+	RtlInitUnicodeString(&phys_mem_str, xorstr_(L"\\Device\\PhysicalMemory"));
+	InitializeObjectAttributes(&oaAttributes, &phys_mem_str, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, (HANDLE)NULL, (PSECURITY_DESCRIPTOR)NULL);
+	HANDLE hPhysMem;
+	if (!NT_SUCCESS(ZwOpenSection(&hPhysMem, SECTION_ALL_ACCESS, &oaAttributes))) {
+		DbgPrint("Failed to open phys mem section\n");
+		return;
+	}
+
+	PVOID PhysicalMemoryBegin = NULL;
+
+	auto Range = MmGetPhysicalMemoryRanges();
+	DWORD64 PhysicalMemorySize = 0;
+
+	while (Range->NumberOfBytes.QuadPart)
+	{
+		PhysicalMemorySize = max(PhysicalMemorySize, Range->BaseAddress.QuadPart + Range->NumberOfBytes.QuadPart);
+		Range++;
+	}
+
+	if (!NT_SUCCESS(ZwMapViewOfSection(
+		hPhysMem,
+		ZwCurrentProcess(),
+		&PhysicalMemoryBegin,
+		NULL,
+		NULL,
+		nullptr,
+		&PhysicalMemorySize,
+		ViewUnmap,
+		NULL,
+		PAGE_READWRITE))) {
+		DbgPrintEx(0, 0, "ZwMapViewOfSection failed.\n");
+		ZwClose(hPhysMem);
+		return;
+	}
+
+	auto processes = get_process_list();
+	if (!processes) {
+		DbgPrint("Unable to get process list.\n");
+		ZwUnmapViewOfSection(ZwCurrentProcess(), PhysicalMemoryBegin);
+		ZwClose(hPhysMem);
+		return;
+	}
+
+	auto walk = processes;
+	while (walk->NextEntryOffset)
+	{
+		/*if ((ULONG)walk->UniqueProcessId != 12132) {
+			walk = (PSYSTEM_PROCESS_INFO)((uintptr_t)walk + walk->NextEntryOffset);
+			continue;
+		}*/
+
+		//instead of reading cr3 from _EPROCESS::DirectoryBase you can obtain it by attaching to the process & __readcr3().
+		KAPC_STATE apcState;
+
+		PEPROCESS process = NULL;
+		if (walk->UniqueProcessId != NULL)
+		if (NT_SUCCESS(PsLookupProcessByProcessId(walk->UniqueProcessId, &process))) {
+
+			__try {
+				KeStackAttachProcess(process, &apcState);
+				auto cr3 = __readcr3();
+				KeUnstackDetachProcess(&apcState);
+
+				PTE_CR3 Cr3 = { cr3 };
+
+				auto system_range_start = VIRT_ADDR{ (uintptr_t)MmSystemRangeStart };
+				
+				//max value of 9 bits = 512
+				for (int pml4_index = system_range_start.pml4_index; pml4_index < 512; pml4_index++)
+				{
+					uint64_t pml4_addr = PFN_TO_PAGE(Cr3.pml4_p) + sizeof(PML4E) * pml4_index;
+					if (pml4_addr > PhysicalMemorySize)
+						continue;
+					auto pml4 = (PML4E*)((uintptr_t)PhysicalMemoryBegin + pml4_addr);
+					if (pml4->present && pml4->user) {
+						for (int pdpt_index = system_range_start.pdpt_index; pdpt_index < 512; pdpt_index++) {
+
+							auto pdpte_addr = PFN_TO_PAGE(pml4->pdpt_p) + sizeof(PDPTE) * pdpt_index;
+							if (pdpte_addr > PhysicalMemorySize)
+								continue;
+
+							auto pdpte = (PDPTE*)((uintptr_t)PhysicalMemoryBegin + pdpte_addr);
+							if (!pdpte->present || !pdpte->user)
+								continue;
+
+							DbgPrint("[DETECTION] kernelmode memory mapped to usermode: %wZ\n", walk->ImageName);
+						}
+
+					}
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				DbgPrint("unexpected AV in detect PI\n");
+			}
+			ObDereferenceObject(process);
+		}
+		else
+			DbgPrint("Unable to lookup _EPROCESS from PID %d\n", (ULONG)walk->UniqueProcessId);
+		//DbgPrint("process: %ws checked\n", walk->ImageName.Buffer);
+
+		walk = (PSYSTEM_PROCESS_INFO)((uintptr_t)walk + walk->NextEntryOffset); // Calculate the address of the next entry.
+	}
+
+	ExFreePoolWithTag(processes, POOL_TAG);
+	ZwUnmapViewOfSection(ZwCurrentProcess(), PhysicalMemoryBegin);
+	ZwClose(hPhysMem);
+}
+
+typedef struct _SYSTEM_BOOT_ENVIRONMENT_INFORMATION_V1 {
+	struct _GUID BootIdentifier;
+	enum _FIRMWARE_TYPE FirmwareType;
+} SYSTEM_BOOT_ENVIRONMENT_INFORMATION_V1, *PSYSTEM_BOOT_ENVIRONMENT_INFORMATION_V1;
+
+// Size=32
+typedef struct _SYSTEM_BOOT_ENVIRONMENT_INFORMATION {
+	struct _GUID BootIdentifier;
+	enum _FIRMWARE_TYPE FirmwareType;
+	unsigned __int64 BootFlags;
+} SYSTEM_BOOT_ENVIRONMENT_INFORMATION, *PSYSTEM_BOOT_ENVIRONMENT_INFORMATION;
+
+void get_boot_uuid()
+{
+	//SystemBootEnvironmentInformation(0x5a)
+	NTSTATUS status = STATUS_SUCCESS;
+	ULONG neededSize = 0;
+
+	neededSize = PAGE_SIZE;
+
+	PSYSTEM_BOOT_ENVIRONMENT_INFORMATION pBootInfo;
+
+	if (pBootInfo = (decltype(pBootInfo))ExAllocatePoolWithTag(NonPagedPool, neededSize, POOL_TAG)) {
+
+		NTSTATUS r;
+		if (NT_SUCCESS(r = ZwQuerySystemInformation(SystemBootEnvironmentInformation, pBootInfo, neededSize, 0))) {
+			DbgPrint("boot GUID: %08X-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X\n", pBootInfo->BootIdentifier.Data1, pBootInfo->BootIdentifier.Data2, pBootInfo->BootIdentifier.Data3, pBootInfo->BootIdentifier.Data4[0], pBootInfo->BootIdentifier.Data4[1], pBootInfo->BootIdentifier.Data4[2], pBootInfo->BootIdentifier.Data4[3], pBootInfo->BootIdentifier.Data4[4], pBootInfo->BootIdentifier.Data4[5], pBootInfo->BootIdentifier.Data4[6], pBootInfo->BootIdentifier.Data4[7]);
+			ExFreePoolWithTag(pBootInfo, POOL_TAG);
+		}
+		else
+			DbgPrint("r = %x\n", r);
+	}
+}
+
+typedef struct _DIRECTORY_BASIC_INFORMATION {
+	UNICODE_STRING ObjectName;
+	UNICODE_STRING ObjectTypeName;
+} DIRECTORY_BASIC_INFORMATION, *PDIRECTORY_BASIC_INFORMATION;
+
+void check_driver_dispatch(PSYSTEM_MODULE_INFORMATION pModuleList)
+{
+	HANDLE hDir;
+	UNICODE_STRING str;
+	OBJECT_ATTRIBUTES oa;
+	RtlInitUnicodeString(&str, xorstr_(L"\\Driver"));
+	InitializeObjectAttributes(&oa, &str, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, (HANDLE)NULL, (PSECURITY_DESCRIPTOR)NULL);
+	if (!NT_SUCCESS(ZwOpenDirectoryObject(&hDir, DIRECTORY_QUERY, &oa))) {
+		DbgPrint("Failed to open \\Driver directory object.\n");
+		return;
+	}
+	
+	PVOID Obj;
+	if (!NT_SUCCESS(ObReferenceObjectByHandle(hDir, DIRECTORY_QUERY, nullptr, KernelMode, &Obj, nullptr))) {
+		DbgPrint("ObReferenceObjectByHandle failed.\n");
+		return;
+	}
+	NtClose(hDir);
+
+	auto obj_type = ObGetObjectType(Obj);
+	ObDereferenceObject(Obj);
+
+	HANDLE h;
+	if (!NT_SUCCESS(ObOpenObjectByName(&oa, obj_type, KernelMode, NULL, DIRECTORY_QUERY, nullptr, &h))) {
+		DbgPrint("ObOpenObjectByName failed.\n");
+		return;
+	}
+	
+	auto dir_info = (PDIRECTORY_BASIC_INFORMATION)ExAllocatePoolWithTag(POOL_TYPE::NonPagedPool, PAGE_SIZE, POOL_TAG);
+	ULONG    ulContext = 0;
+
+	ULONG returned_bytes;
+	
+	while (NT_SUCCESS(ZwQueryDirectoryObject(h, dir_info, PAGE_SIZE, TRUE, FALSE, &ulContext, &returned_bytes))) {
+		PDRIVER_OBJECT pObj;
+		wchar_t wsDriverName[100] = L"\\Driver\\";
+		wcscat(wsDriverName, dir_info->ObjectName.Buffer);
+		UNICODE_STRING ObjName;
+		ObjName.Length = ObjName.MaximumLength = wcslen(wsDriverName) * 2;
+		ObjName.Buffer = wsDriverName;
+		if (NT_SUCCESS(ObReferenceObjectByName(&ObjName, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL, *IoDriverObjectType, KernelMode, nullptr, (PVOID*)&pObj))) {
+			//DbgPrint("%wZ\n", pObj->DriverName);
+
+			if (is_address_outside_of_module_list(pModuleList, reinterpret_cast<uintptr_t>(pObj->MajorFunction[IRP_MJ_DEVICE_CONTROL]))) {
+				DbgPrint("[DETECTION] %wZ driver has spoofed driver dispatch\n", pObj->DriverName);
+			}
+
+			if (is_address_outside_of_module_list(pModuleList, (uintptr_t)pObj->DriverStart)) {
+				DbgPrint("[DETECTION] %wZ driver has spoofed DriverStart\n", pObj->DriverName);
+			}
+
+			auto dd = reinterpret_cast<uintptr_t>(pObj->MajorFunction[IRP_MJ_DEVICE_CONTROL]);
+			if (dd < (uintptr_t)pObj->DriverStart || dd >(uintptr_t)pObj->DriverStart + pObj->DriverSize) {
+				DbgPrint("[DETECTION] %wZ driver has spoofed driver dispatch (2)\n", pObj->DriverName);
+			}
+
+			if (is_address_outside_of_module_list(pModuleList, reinterpret_cast<uintptr_t>(pObj->FastIoDispatch))) {
+				DbgPrint("[DETECTION] %wZ driver has spoofed FastIoDispatch\n", pObj->DriverName);
+			}
+
+			ObDereferenceObject(pObj);
+		}
+		
+	}
+
+
+	ZwClose(h);
+}
+
 void check()
 {
+	get_boot_uuid(); //checking if i've spoofed it properly.
+	
 	auto pModuleList = GetKernelModuleList();
+
 	DbgPrint("Scanning system threads\n");
 	scan_system_threads(pModuleList);
 	DbgPrint("Finished scanning system threads\n");
-	
+
 	DbgPrint("Scanning bigpool\n");
 	scan_bigpool_check_2();
 	DbgPrint("Finished scanning bigpool\n");
@@ -658,7 +1008,21 @@ void check()
 	check_piddb();
 	DbgPrint("scanned PiDDBCacheTable\n");
 
+	if (is_lazy_hypervisor_running()) //https://gist.github.com/drew0709/d31840bebbbb1ff1d112a6f46e162c05
+		DbgPrint("lazy hypervisor detected\n");
+	if (!detect_hypervisor())
+		DbgPrint("HV not detected\n");
+
+	check_physical_memory_handles();
+
+	detect_perfect_injector();
+
+	check_driver_dispatch(pModuleList);
+	DbgPrint("scanned driver dispatch\n");
+
 	ExFreePoolWithTag(pModuleList, POOL_TAG);
+
+	DbgPrint("Scan routine finished!\n");
 }
 
 DRIVER_UNLOAD MyUnload;
@@ -685,11 +1049,13 @@ DriverEntry(
 
 	DriverObject->DriverUnload = MyUnload;
 
-	DbgPrint("(KERNEL) anti-cheat simulator v1\r\n");
+	DbgPrint("(KERNEL) anti-cheat simulator v2\n");
 	
 	HANDLE hThread;
-	PsCreateSystemThread(&hThread, STANDARD_RIGHTS_ALL, NULL, NULL, NULL, (PKSTART_ROUTINE)&check, NULL);
-	ZwClose(hThread);
+	if (NT_SUCCESS(PsCreateSystemThread(&hThread, STANDARD_RIGHTS_ALL, NULL, NULL, NULL, (PKSTART_ROUTINE)&check, NULL)))
+		ZwClose(hThread);
+	else
+		DbgPrint("Failed to create check thread.\n");
 
 	return true;
 }
